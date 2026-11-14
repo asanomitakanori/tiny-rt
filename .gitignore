@@ -1,0 +1,7 @@
+build/
+test/logs/*
+!test/logs/.gitkeep
+**/__pycache__/
+results.xml
+.DS_Store
+.venv/
