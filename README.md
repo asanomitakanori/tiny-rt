@@ -1,93 +1,169 @@
 # tiny-rt
 
-A minimal ray-tracing accelerator in Verilog, built to learn how BVH traversal and intersection work in hardware. Inspired by [tiny-gpu](https://github.com/adam-maj/tiny-gpu), tiny-rt follows a similar project layout; all code here is original. It trades performance and generality for a small, readable implementation and a working simulation.
+A minimal ray tracing unit in Verilog, built to learn how RT cores work from the ground up.
 
-![Architecture](docs/images/architecture.svg)
+Built with 9 small, fully commented SystemVerilog modules, a bit-exact Python reference model, and a working simulation that renders an image.
+
+Inspired by [tiny-gpu](https://github.com/adam-maj/tiny-gpu). tiny-rt follows a similar project layout. All code here is original.
+
+<p float="left">
+  <img src="docs/images/render.png" alt="Shaded scene" width="40%">
+  <img src="docs/images/render_ids.png" alt="Triangle IDs" width="40%">
+</p>
+
+*Left: the final image. Right: the raw triangle IDs returned by the hardware.*
+
+### Table of Contents
+
+- [Overview](#overview)
+- [Architecture](#architecture)
+- [How a Ray is Traced](#how-a-ray-is-traced)
+- [Intersection Math](#intersection-math)
+- [Memory Layout](#memory-layout)
+- [Simulation](#simulation)
+- [Next Steps](#next-steps)
 
 # Overview
 
-A shader core can generate rays and shade their results. The fixed-function RT unit does the repetitive geometric work: walk a bounding volume hierarchy (BVH), test boxes and triangles, and return the closest triangle ID. In this project Python plays the host and shader: it builds the BVH, generates camera rays, and shades the IDs. The hardware does traversal and intersection. No GPU or graphics API is required.
+Modern GPUs have dedicated hardware for ray tracing.
 
-<p>
-  <img src="docs/images/render.png" alt="Shaded scene" width="40%">
-  <img src="docs/images/render_ids.png" alt="Triangle IDs in false color" width="40%">
-</p>
+NVIDIA calls it the RT core.
 
-Left: host-shaded scene. Right: false colors assigned to the triangle IDs returned by hardware.
+How it works inside is not public.
 
-The scene test renders a small Cornell-box-like room at 64 × 64 pixels. With two cores, it completes in 1,040,481 cycles with 3,600 hits out of 4,096 rays; the 8 × 8 triangle test takes 1,395 cycles with 8 hits. The colors and flat Lambert shading are applied by Python, after the hardware returns its results.
+Ray tracing asks one question over and over: **which triangle does this ray hit first?**
+
+A scene has many triangles. Testing all of them for every ray is far too slow.
+
+So scenes are stored in a **BVH** (bounding volume hierarchy). It is a tree of boxes. If a ray misses a box, everything inside it can be skipped.
+
+An RT unit does three things very fast:
+
+1. **Walk the BVH** - decide which box to visit next
+2. **Ray-box test** - does the ray pass through this box?
+3. **Ray-triangle test** - does the ray hit this triangle, and how far away?
+
+Everything else stays on the shader cores. They create the rays and color the results.
+
+In tiny-rt, Python plays the shader cores. The Verilog plays the RT unit.
+
+```
+shader (Python)                   RT unit (Verilog)
+───────────────                   ─────────────────
+create rays     ───────────────▶  walk BVH
+                                  ray-box tests
+                                  ray-triangle tests
+shade pixels    ◀───────────────  "ray 17 hit triangle 5"
+```
 
 # Architecture
 
-- **DCR** holds the 16-bit ray count. Write it before launch.
-- **Dispatch** gives one ray index at a time to an idle core and asserts `done` after all writes finish. Reset before another launch.
-- **Cores** load a ray, start traversal, and write one result. The default is two cores.
-- **Controllers** arbitrate core requests onto external scene-read and framebuffer-write channels. Priority rotates after accepted transfers, and stalled channel assignments remain reserved until ready. The test memory responds combinationally; a slower memory may hold ready low. Channel 0 occupies the least significant packed slice.
-- **Traversal** uses a 16-entry stack for deferred right children. The builder must produce a tree that fits; stack overflow is not reported.
-- **Box and triangle tests** are combinational fixed-point datapaths. They favor readability over area and timing.
+![Architecture](docs/images/architecture.svg)
 
-Parameters on `rt` select core count, address widths and channel counts. The data buses and arithmetic are 32 bits; the data-width parameters must remain 32. The default address widths are 16 bits. There is no cache, pipelining, or simultaneous launches.
+To launch a job:
 
-## How a ray is traced
+1. Load rays, BVH nodes and triangles into scene memory
+2. Write the number of rays to the device control register
+3. Set `start` high and wait for `done`
+4. Read one triangle ID per ray from framebuffer memory
 
-The host writes the ray count, pulses `start`, and waits for `done`. Each core loads nine words of ray data, then the traversal FSM proceeds as follows:
+The unit consists of:
 
-1. `NODE`: read eight words for the current node.
-2. `BOX`: test its bounds. On a miss, go to `NEXT`. On an internal hit, push the right child and visit the left child. On a leaf hit, begin reading its triangles.
-3. `TRI`: read nine words of one triangle.
-4. `TEST`: update the closest result if this triangle is closer; repeat for the remaining leaf triangles.
-5. `NEXT`: pop a deferred node, or finish when the stack is empty.
-6. `FINISH`: return the ID to the core, which writes it to framebuffer memory.
+- **Device control register** - stores the ray count.
+- **Dispatcher** - hands the next ray index to an idle core.
+- **Cores** - each core traces one ray at a time. The default is 2 cores.
+- **Memory controllers** - share limited memory channels between the cores, in round-robin order.
+- **Traversal** - the BVH walking state machine, with a 16-entry stack.
+- **Box test / triangle test** - the intersection math.
 
-Traversal does not prune nodes using the current best distance. Ties retain the first triangle encountered, so traversal order is part of the result.
+There is no cache and no pipelining. Each part is kept simple to read.
 
-## Intersection math
+# How a Ray is Traced
 
-Coordinates, directions and inverse directions are signed Q16.16. The host clamps inverse directions to signed 32-bit range and the box unit handles an exactly zero direction separately. The slab test computes `(bound - origin) * inv_dir >> 16`, intersects the three intervals with `[0, infinity)`, and accepts boundary contact. A clamped inverse direction is an approximation; choose rays and bounds accordingly.
+Each core first loads its ray. Then the traversal state machine runs:
 
-The triangle unit uses Möller–Trumbore without division. Each multiplication in a cross or dot product is shifted right by 16 **before** summation, including for negative values; arithmetic right shift rounds toward negative infinity. For edge vectors `e1`, `e2`, ray direction `d`, and `s = origin - v0`:
+1. `NODE` - read the current BVH node.
+2. `BOX` - test the ray against the node's box.
+   - Miss: go to `NEXT`.
+   - Hit an inner node: push the right child, visit the left child.
+   - Hit a leaf: start reading its triangles.
+3. `TRI` - read one triangle.
+4. `TEST` - keep it if it is the closest hit so far. Repeat for each triangle in the leaf.
+5. `NEXT` - pop the next node from the stack. If the stack is empty, finish.
+6. `FINISH` - write the closest triangle ID to the framebuffer.
+
+# Intersection Math
+
+All numbers are 32-bit fixed point (Q16.16).
+
+### Ray-box test
+
+The slab test. For each axis:
 
 ```text
-p = d cross e2              det = e1 dot p
-u = s dot p                 q = s cross e1
-v = d dot q                 t = e2 dot q
-if det < 0: negate det, u, v, t
-hit = det > 0 and u >= 0 and v >= 0 and u + v <= det and t > 0
+t1 = (box_min - origin) * inv_dir
+t2 = (box_max - origin) * inv_dir
+```
+
+The ray hits the box if the three `[t1, t2]` ranges overlap in front of the ray.
+
+`inv_dir = 1 / dir` is computed by the host, so the hardware needs no divider.
+
+### Ray-triangle test
+
+Möller–Trumbore, without division:
+
+```text
+e1 = v1 - v0        e2 = v2 - v0        s = origin - v0
+p  = dir × e2       det = e1 · p
+q  = s × e1         u = s · p
+v  = dir · q        t = e2 · q
+
+hit    = det > 0 and u >= 0 and v >= 0 and u + v <= det and t > 0
 closer = t * best_det < best_t * det
 ```
 
-The shifted products and sums use signed 64-bit intermediates; closest-hit cross products use 128 bits. With vertex and origin coordinates within ±8, normalized direction components within ±1, and signed 32-bit inverse directions, these intermediates have ample range. The Python reference performs the same individual shifts and comparison. This is fixed-point geometry, not a promise of agreement with floating-point intersection at edges or nearly parallel triangles.
+`closer` compares `t / det` against the best hit so far. Cross-multiplying avoids the division.
 
-# Memory layout
+# Memory Layout
 
-Addresses are **32-bit word** indices, not byte addresses. All signed numbers are two's-complement words. The default 16-bit address space has fixed bases:
+Addresses are 32-bit word indices.
 
-| Region | Base | Contents |
+| Region | Base | Per entry |
 | --- | ---: | --- |
-| Rays | 0 | Per ray: origin xyz, direction xyz, inverse direction xyz (9 words) |
-| BVH nodes | 40960 | Per node: min xyz, max xyz, left-or-first, count (8 words) |
-| Triangles | 49152 | Per triangle: v0 xyz, v1 xyz, v2 xyz (9 words) |
-| Framebuffer | 0 | One word per ray: reordered triangle ID, or `0xffffffff` for a miss |
+| Rays | 0 | origin xyz, dir xyz, inv_dir xyz (9 words) |
+| BVH nodes | 40960 | min xyz, max xyz, left/first, count (8 words) |
+| Triangles | 49152 | v0 xyz, v1 xyz, v2 xyz (9 words) |
+| Framebuffer | 0 | triangle ID, or `0xffffffff` on miss (1 word) |
 
-Node 0 is the root. `count == 0` means an internal node with children `left` and `left + 1`. A nonzero count means a leaf containing triangles `[first, first + count)`. The Python builder reorders triangles into contiguous leaves and supplies a map back to the original material IDs. The ray region fits at most 4551 rays without overlapping nodes; all regions must fit their configured address width. Geometry and tree contents are trusted inputs.
+For BVH nodes:
+
+- `count == 0` - inner node. Children are `left` and `left + 1`.
+- `count > 0` - leaf. Triangles are `first` to `first + count - 1`.
 
 # Simulation
 
-Install Icarus Verilog and [sv2v](https://github.com/zachjs/sv2v), then create a Python environment with cocotb:
+Install [Icarus Verilog](https://github.com/steveicarus/iverilog) and [sv2v](https://github.com/zachjs/sv2v). Then:
 
 ```sh
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
-make test_triangle
-make test_scene
+
+make test_triangle   # 1 triangle, 8x8 rays
+make test_scene      # Cornell-box style room, 64x64 rays
 ```
 
-The Makefile converts the SystemVerilog with sv2v and runs Icarus with cocotb. cocotb 1.9.2 may require a compatible Python and compiler combination. The tests compare every framebuffer word with the integer Python model. They log per-cycle core/traversal states in `test/logs/`; the scene test also writes `docs/images/render.png` and `docs/images/render_ids.png`.
+Each test checks every pixel against the Python reference model.
 
-# Next steps
+`test_scene` takes about a minute. It finishes in 1,040,481 cycles and writes the images above to `docs/images/`.
 
-- Prune BVH nodes using the current closest distance and traverse nearer children first.
-- Add stack overflow detection, fair arbitration, caches and pipelined arithmetic.
-- Generate rays in hardware and support more flexible scene layouts.
-- Integrate with tiny-gpu using a `TRACE` instruction and shader-side shading.
+Per-cycle core states are logged to `test/logs/`.
+
+# Next Steps
+
+- Skip BVH nodes that are farther than the closest hit so far
+- Visit the nearer child first
+- Generate rays in hardware
+- Add a cache and pipeline the math
+- Connect to tiny-gpu as a `TRACE` instruction
